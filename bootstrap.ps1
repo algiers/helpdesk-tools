@@ -105,47 +105,44 @@ if (!(Get-NetFirewallRule -Name $ruleName -ea 0)) {
 }
 Log "Firewall OK"
 
-# ===== Tâche planifiée via XML — sshd direct, sans wrapper =====
-schtasks /delete /tn "OpenSSH-sshd" /f 2>$null | Out-Null
+# ===== NSSM — téléchargement =====
+$nssmDir = "$sshdDataDir\nssm"
+$nssmExe = "$nssmDir\nssm.exe"
+
+if (!(Test-Path $nssmExe)) {
+    Log "Téléchargement NSSM..."
+    try {
+        Invoke-WebRequest "https://nssm.cc/release/nssm-2.24.zip" `
+            -OutFile "$env:TEMP\nssm.zip" -UseBasicParsing
+        Expand-Archive "$env:TEMP\nssm.zip" -DestinationPath "$env:TEMP\nssm-extract" -Force
+        New-Item -ItemType Directory -Force -Path $nssmDir | Out-Null
+        Copy-Item "$env:TEMP\nssm-extract\nssm-2.24\win64\nssm.exe" $nssmExe -Force
+        Log "NSSM téléchargé ✅"
+    } catch {
+        Die "Impossible de télécharger NSSM : $_"
+    }
+} else {
+    Log "NSSM déjà présent ✅"
+}
+
+# ===== NSSM — installer sshd comme vrai service Windows =====
+$svcName = "OpenSSH-sshd"
+
+# Supprimer l'ancien service si présent
+if (Get-Service $svcName -ea 0) {
+    & $nssmExe stop $svcName 2>$null
+    & $nssmExe remove $svcName confirm 2>$null
+    Start-Sleep -Seconds 2
+}
 Stop-Process -Name sshd -Force -ea 0
 
-$xmlPath = "$sshdDataDir\sshd-task.xml"
-$taskXml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
-    <BootTrigger><Enabled>true</Enabled></BootTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>S-1-5-18</UserId>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>999</Count>
-    </RestartOnFailure>
-    <Enabled>true</Enabled>
-  </Settings>
-  <Actions>
-    <Exec>
-      <Command>$sshdBin</Command>
-      <Arguments>-D -p $sshPort -f "$config"</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"@
-
-$taskXml | Out-File -FilePath $xmlPath -Encoding Unicode
-schtasks /create /tn "OpenSSH-sshd" /xml "$xmlPath" /f | Out-Null
-schtasks /run /tn "OpenSSH-sshd" | Out-Null
-Log "Tâche planifiée créée et lancée"
+# Créer le service avec NSSM
+& $nssmExe install $svcName $sshdBin "-D -p $sshPort -f `"$config`"" | Out-Null
+& $nssmExe set $svcName AppNoConsole 1              | Out-Null
+& $nssmExe set $svcName DisplayName "OpenSSH Server" | Out-Null
+& $nssmExe set $svcName Start SERVICE_AUTO_START     | Out-Null
+& $nssmExe set $svcName AppRestartDelay 3000         | Out-Null
+& $nssmExe start $svcName                            | Out-Null
 
 # Attendre que le port écoute (max 30s)
 $elapsed = 0; $portOk = $false
