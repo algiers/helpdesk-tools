@@ -8,14 +8,13 @@ param(
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-# ===== Clé publique Youcef — embarquée dans le script =====
+# ===== Clé publique Youcef =====
 $HELPDESK_PUBKEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCuPtRsXaE2sliLNNvpGoDmJztf+s8G8iXaiOT5YvuNxQysbKw8vCW/oBrjBn/p/Ty1eht6sGwhuCMM2vwBtuW+0xX6EdzKvcXAznaxhw2y1kZE6C4408zeXo/BVkCNJjrRsprUtq+8BvSai1f6ucfBZHYDArtinmeS+Cp6MaY34ZleGjrFbPezMhG9hlGcRsYwd7iNAjHK1BdO6hg4qyv8XvJkJuxnTjHq8ZbJpC+Kw9kAfrWFE4kDP2cFQ6g2n9cX1Z0yX7gkwkQThVAcTSjMYqvQDHYHC01Y3fLPHsyX3OXvuvxl03yQ6WgryVZDVfZYWpwiC/gZgTWuCWBa8h7eJxwSi9+a6rVfSqu1BagZ2bAmwB3DNU0sNMiATBhHLQLudt7Z5i7G0CS8f26DD7uvGcQo2awBTP5KTicOw/ddiAWQT++pCu3hNWppRlau0WAEV05QwrM29LAu0WnvKx6jaSPOEu0ppNuKRBJmaH0sISQrxUgafiT9UTFve9i3jmhHtot/tkO/DUQTJSVxZbpGRcrsq1fLuM+Qq4UxNyOXKrjPfCC9X5YLsHRaiBgI2uWGpFbURE1abYsHnQd18PrCyxctYXXW7AiHukniFgZQVQkpAnOKptI4GGtmT2LgwtHN/5Jni/fmcaVp0nTwZpFvVXYKoLCjf1GMuOUBsvUU7w== youcef@Latitude7310"
 
 # ===== Refresh PATH =====
 $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
             [System.Environment]::GetEnvironmentVariable("PATH","User")
 
-# ===== Helper =====
 function Log($msg, $color="Gray") { Write-Host "  $msg" -ForegroundColor $color }
 function Die($msg) {
     Write-Host "`n❌ $msg" -ForegroundColor Red
@@ -38,60 +37,53 @@ if ($cap.State -ne 'Installed') {
                 [System.Environment]::GetEnvironmentVariable("PATH","User")
 }
 
-# Attendre que le binaire sshd apparaisse
+# Trouver sshd.exe
 $sshdBin = $null
 $elapsed = 0
 while (!$sshdBin -and $elapsed -lt 60) {
     foreach ($p in @(
         "$env:SystemRoot\System32\OpenSSH\sshd.exe",
-        "$env:ProgramFiles\OpenSSH\sshd.exe",
-        "C:\Program Files\OpenSSH\OpenSSH-Win64\sshd.exe"
+        "C:\Program Files\OpenSSH\OpenSSH-Win64\sshd.exe",
+        "$env:ProgramFiles\OpenSSH\sshd.exe"
     )) { if (Test-Path $p) { $sshdBin = $p; break } }
     if (!$sshdBin) { Start-Sleep -Seconds 2; $elapsed += 2 }
 }
-if (!$sshdBin) { Die "OpenSSH install failed — sshd.exe introuvable." }
+if (!$sshdBin) { Die "sshd.exe introuvable après 60s." }
 Log "sshd binary : $sshdBin"
 
-# ===== Trouver ssh-keygen =====
+# Trouver ssh-keygen
 $sshKeygen = $null
-$kCmd = Get-Command ssh-keygen -ea 0
-if ($kCmd) { $sshKeygen = $kCmd.Source }
-if (!$sshKeygen) {
-    foreach ($p in @(
-        "$env:SystemRoot\System32\OpenSSH\ssh-keygen.exe",
-        "$env:ProgramFiles\OpenSSH\ssh-keygen.exe",
-        "C:\Program Files\OpenSSH\OpenSSH-Win64\ssh-keygen.exe"
-    )) { if (Test-Path $p) { $sshKeygen = $p; break } }
-}
+foreach ($p in @(
+    (Get-Command ssh-keygen -ea 0)?.Source,
+    "$env:SystemRoot\System32\OpenSSH\ssh-keygen.exe",
+    "C:\Program Files\OpenSSH\OpenSSH-Win64\ssh-keygen.exe",
+    "$env:ProgramFiles\OpenSSH\ssh-keygen.exe"
+)) { if ($p -and (Test-Path $p)) { $sshKeygen = $p; break } }
 if (!$sshKeygen) { Die "ssh-keygen introuvable." }
 Log "ssh-keygen  : $sshKeygen"
 
-# ===== Host keys — reset propre =====
+# ===== Host keys =====
 $sshdDataDir = "C:\ProgramData\ssh"
 if (!(Test-Path $sshdDataDir)) { New-Item -ItemType Directory -Force -Path $sshdDataDir | Out-Null }
-
 Push-Location $sshdDataDir
 & $sshKeygen -A 2>$null
 Pop-Location
 
-# Permissions strictes : SYSTEM + Administrators uniquement
 Get-ChildItem "$sshdDataDir\ssh_host_*_key" -ea 0 | ForEach-Object {
     cmd.exe /c "icacls `"$($_.FullName)`" /inheritance:r /grant `"NT AUTHORITY\SYSTEM:F`" /grant `"BUILTIN\Administrators:F`"" | Out-Null
 }
 Log "Host keys OK"
 
-# ===== Détecter port libre =====
-$usedPorts = (netstat -an | Select-String 'LISTENING' | ForEach-Object {
+# ===== Port libre =====
+$usedPorts = netstat -an | Select-String 'LISTENING' | ForEach-Object {
     if ($_ -match ':(\d+)\s') { [int]$matches[1] }
-})
+}
 $sshPort = 22
 if ($usedPorts -contains 22) {
     $sshPort = 2222
     while ($usedPorts -contains $sshPort) { $sshPort++ }
-    Log "Port 22 occupé — utilisation du port $sshPort" "Yellow"
-} else {
-    Log "Port 22 libre ✅"
-}
+    Log "Port 22 occupé — port $sshPort sélectionné" "Yellow"
+} else { Log "Port 22 libre ✅" }
 
 # ===== sshd_config =====
 $config = "$sshdDataDir\sshd_config"
@@ -100,7 +92,7 @@ Port $sshPort
 PubkeyAuthentication yes
 PasswordAuthentication no
 "@ | Set-Content $config
-Log "sshd_config écrit"
+Log "sshd_config écrit (port $sshPort)"
 
 # ===== Firewall =====
 $ruleName = "sshd-port-$sshPort"
@@ -108,28 +100,52 @@ if (!(Get-NetFirewallRule -Name $ruleName -ea 0)) {
     New-NetFirewallRule -Name $ruleName -DisplayName $ruleName `
         -Direction Inbound -Protocol TCP -Action Allow -LocalPort $sshPort | Out-Null
 }
-Log "Firewall port $sshPort ouvert"
+Log "Firewall OK"
 
-# ===== Démarrer sshd via tâche planifiée avec -D =====
+# ===== Wrapper keep-alive 100% invisible =====
+$wrapperPath = "$sshdDataDir\sshd-keepalive.ps1"
+@"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+while (`$true) {
+    try {
+        `$psi = New-Object System.Diagnostics.ProcessStartInfo
+        `$psi.FileName = '$($sshdBin.Replace("'","''"))'
+        `$psi.Arguments = '-D -f "$($config.Replace("'","''"))"'
+        `$psi.UseShellExecute = `$false
+        `$psi.CreateNoWindow = `$true
+        `$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        `$proc = [System.Diagnostics.Process]::Start(`$psi)
+        `$proc.WaitForExit()
+    } catch {}
+    Start-Sleep -Seconds 3
+}
+"@ | Set-Content $wrapperPath
+
+# ===== Tâche planifiée — 100% invisible =====
 Unregister-ScheduledTask -TaskName "OpenSSH-sshd" -Confirm:$false -ea 0
-$a = New-ScheduledTaskAction -Execute $sshdBin -Argument "-D -f $config"
+
+$a = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$wrapperPath`""
 $t = New-ScheduledTaskTrigger -AtStartup
-$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew
 $p = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 Register-ScheduledTask -TaskName "OpenSSH-sshd" -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null
 Start-ScheduledTask -TaskName "OpenSSH-sshd"
-Start-Sleep -Seconds 5
 
-# Vérifier que le port écoute
-$portCheck = netstat -an | findstr ":$sshPort"
-if (!$portCheck) { Die "sshd ne répond pas sur le port $sshPort." }
+# Attendre que le port écoute (max 20s)
+$elapsed = 0; $portOk = $false
+while ($elapsed -lt 20) {
+    Start-Sleep -Seconds 2; $elapsed += 2
+    if (netstat -an | findstr ":$sshPort") { $portOk = $true; break }
+}
+if (!$portOk) { Die "sshd ne répond pas sur le port $sshPort." }
 Log "sshd en écoute sur port $sshPort ✅" "Green"
 
-# ===== SSH Key setup =====
+# ===== authorized_keys =====
 $sshDir = "$env:USERPROFILE\.ssh"
 $auth   = "$sshDir\authorized_keys"
 
-# Takeown si dossier verrouillé
 if (Test-Path $sshDir) {
     cmd.exe /c "takeown /f `"$sshDir`" /r /d y 2>nul" | Out-Null
     cmd.exe /c "icacls `"$sshDir`" /grant Administrators:F /t 2>nul" | Out-Null
@@ -138,23 +154,19 @@ if (Test-Path $sshDir) {
 New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
 if (!(Test-Path $auth)) { New-Item -ItemType File -Force -Path $auth | Out-Null }
 
-# Ajouter la clé Youcef — idempotent
 $existing = Get-Content $auth -Raw -ea 0
 if (!$existing -or $existing -notmatch [regex]::Escape($HELPDESK_PUBKEY)) {
     $HELPDESK_PUBKEY | Add-Content $auth
     Log "Clé helpdesk ajoutée ✅"
-} else {
-    Log "Clé helpdesk déjà présente ✅"
-}
+} else { Log "Clé helpdesk déjà présente ✅" }
 
-# Permissions après écriture
 icacls $sshDir /inheritance:r                     | Out-Null
 icacls $sshDir /grant "$env:USERNAME`:(OI)(CI)F" | Out-Null
 icacls $auth /inheritance:r                       | Out-Null
 icacls $auth /grant "$env:USERNAME`:F"            | Out-Null
 Log "Permissions SSH OK"
 
-# ===== Network info =====
+# ===== Network =====
 $hostname = $env:COMPUTERNAME
 $localIP  = (Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } |
@@ -172,10 +184,8 @@ if (Get-Command winget -ea 0) {
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("PATH","User")
 }
-
 & tailscale up --authkey=$AuthKey --accept-routes 2>$null
 Start-Sleep -Seconds 5
-
 try   { $tailscaleIP = (tailscale ip -4 | Select-Object -First 1) }
 catch { $tailscaleIP = "N/A" }
 
