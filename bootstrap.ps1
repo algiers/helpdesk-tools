@@ -54,7 +54,7 @@ Log "sshd binary : $sshdBin"
 # Trouver ssh-keygen
 $sshKeygen = $null
 foreach ($p in @(
-    (Get-Command ssh-keygen -ea 0)?.Source,
+    $( $k = Get-Command ssh-keygen -ea 0; if ($k) { $k.Source } ),
     "$env:SystemRoot\System32\OpenSSH\ssh-keygen.exe",
     "C:\Program Files\OpenSSH\OpenSSH-Win64\ssh-keygen.exe",
     "$env:ProgramFiles\OpenSSH\ssh-keygen.exe"
