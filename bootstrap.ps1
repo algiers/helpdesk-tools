@@ -4,7 +4,7 @@ param(
     [string]$AuthKey
 )
 
-# ===== TLS + ExecutionPolicy fix =====
+# ===== TLS + ExecutionPolicy =====
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
@@ -14,7 +14,7 @@ if (Get-Command winget -ea 0) {
         --accept-package-agreements --accept-source-agreements | Out-Null
 }
 
-# ===== OpenSSH — install + attendre que le service soit prêt =====
+# ===== OpenSSH install =====
 $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
 if ($cap.State -ne 'Installed') {
     Write-Host "  Installing OpenSSH..." -ForegroundColor Gray
@@ -22,16 +22,26 @@ if ($cap.State -ne 'Installed') {
 }
 
 # Attendre que le service sshd apparaisse (max 60s)
-$timeout = 60
 $elapsed = 0
-while (!(Get-Service sshd -ea 0) -and $elapsed -lt $timeout) {
-    Start-Sleep -Seconds 2
-    $elapsed += 2
+while (!(Get-Service sshd -ea 0) -and $elapsed -lt 60) {
+    Start-Sleep -Seconds 2; $elapsed += 2
+}
+if (!(Get-Service sshd -ea 0)) {
+    Write-Host "❌ OpenSSH install failed." -ForegroundColor Red; exit 1
 }
 
-if (!(Get-Service sshd -ea 0)) {
-    Write-Host "❌ OpenSSH install failed or timed out." -ForegroundColor Red
-    exit 1
+# ===== Générer les host keys (manquantes après install) =====
+$opensshDir = "$env:SystemRoot\System32\OpenSSH"
+if (Test-Path "$opensshDir\ssh-keygen.exe") {
+    Push-Location $opensshDir
+    .\ssh-keygen.exe -A 2>$null
+    Pop-Location
+}
+
+# Fixer les permissions des host keys
+$fixScript = "$opensshDir\FixHostFilePermissions.ps1"
+if (Test-Path $fixScript) {
+    & $fixScript -Confirm:$false 2>$null
 }
 
 Start-Service sshd
@@ -49,17 +59,27 @@ $key    = "$sshDir\id_rsa"
 $pub    = "$key.pub"
 $auth   = "$sshDir\authorized_keys"
 
-if (!(Test-Path $key)) {
+# Créer le dossier .ssh
+if (!(Test-Path $sshDir)) {
     New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+}
+
+# Générer la clé si absente
+if (!(Test-Path $key)) {
     ssh-keygen -t rsa -b 4096 -N '""' -f $key | Out-Null
 }
 
-# Authorize own key — idempotent
+# Écrire authorized_keys AVANT de fixer les permissions
 $pubContent = (Get-Content $pub -Raw).Trim()
-$alreadyIn  = (Test-Path $auth) -and ((Get-Content $auth -Raw) -match [regex]::Escape($pubContent))
-if (!$alreadyIn) { $pubContent | Add-Content $auth }
+if (!(Test-Path $auth)) {
+    New-Item -ItemType File -Force -Path $auth | Out-Null
+}
+$existing = Get-Content $auth -Raw -ea 0
+if (!$existing -or $existing -notmatch [regex]::Escape($pubContent)) {
+    $pubContent | Add-Content $auth
+}
 
-# Fix permissions
+# Fixer les permissions APRÈS écriture
 icacls $sshDir /inheritance:r                     | Out-Null
 icacls $sshDir /grant "$env:USERNAME`:(OI)(CI)F" | Out-Null
 icacls $auth /inheritance:r                       | Out-Null
