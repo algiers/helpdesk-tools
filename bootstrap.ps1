@@ -30,18 +30,25 @@ if (!(Get-Service sshd -ea 0)) {
     Write-Host "❌ OpenSSH install failed." -ForegroundColor Red; exit 1
 }
 
-# ===== Générer les host keys (manquantes après install) =====
-$opensshDir = "$env:SystemRoot\System32\OpenSSH"
-if (Test-Path "$opensshDir\ssh-keygen.exe") {
-    Push-Location $opensshDir
-    .\ssh-keygen.exe -A 2>$null
-    Pop-Location
+# ===== Générer les host keys dans le bon répertoire =====
+$opensshBin  = "$env:SystemRoot\System32\OpenSSH"
+$sshdDataDir = "C:\ProgramData\ssh"
+
+if (!(Test-Path $sshdDataDir)) {
+    New-Item -ItemType Directory -Force -Path $sshdDataDir | Out-Null
 }
 
-# Fixer les permissions des host keys
-$fixScript = "$opensshDir\FixHostFilePermissions.ps1"
-if (Test-Path $fixScript) {
-    & $fixScript -Confirm:$false 2>$null
+# Générer toutes les host keys dans C:\ProgramData\ssh\
+Push-Location $sshdDataDir
+& "$opensshBin\ssh-keygen.exe" -A 2>$null
+Pop-Location
+
+# Fixer les permissions des host keys pour NT SERVICE\sshd
+Get-ChildItem "$sshdDataDir\ssh_host_*_key" -ea 0 | ForEach-Object {
+    icacls $_.FullName /inheritance:r                          | Out-Null
+    icacls $_.FullName /grant "NT AUTHORITY\SYSTEM:F"          | Out-Null
+    icacls $_.FullName /grant "BUILTIN\Administrators:F"       | Out-Null
+    icacls $_.FullName /grant "NT SERVICE\sshd:R"              | Out-Null
 }
 
 Start-Service sshd
@@ -59,21 +66,22 @@ $key    = "$sshDir\id_rsa"
 $pub    = "$key.pub"
 $auth   = "$sshDir\authorized_keys"
 
-# Créer le dossier .ssh
-if (!(Test-Path $sshDir)) {
-    New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+# Reprendre ownership si permissions cassées par un run précédent
+if (Test-Path $sshDir) {
+    takeown /f $sshDir /r /d y 2>$null | Out-Null
+    icacls $sshDir /reset /t 2>$null   | Out-Null
 }
+
+New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
 
 # Générer la clé si absente
 if (!(Test-Path $key)) {
     ssh-keygen -t rsa -b 4096 -N '""' -f $key | Out-Null
 }
 
-# Écrire authorized_keys AVANT de fixer les permissions
+# Créer authorized_keys et y ajouter la clé — idempotent
 $pubContent = (Get-Content $pub -Raw).Trim()
-if (!(Test-Path $auth)) {
-    New-Item -ItemType File -Force -Path $auth | Out-Null
-}
+if (!(Test-Path $auth)) { New-Item -ItemType File -Force -Path $auth | Out-Null }
 $existing = Get-Content $auth -Raw -ea 0
 if (!$existing -or $existing -notmatch [regex]::Escape($pubContent)) {
     $pubContent | Add-Content $auth
@@ -86,15 +94,24 @@ icacls $auth /inheritance:r                       | Out-Null
 icacls $auth /grant "$env:USERNAME`:F"            | Out-Null
 
 # ===== sshd_config =====
-$config = "C:\ProgramData\ssh\sshd_config"
-if (Test-Path $config) {
-    $c = Get-Content $config
-    $c = $c -replace '^\s*#?\s*PubkeyAuthentication\s+\w+',  'PubkeyAuthentication yes'
-    $c = $c -replace '^\s*#?\s*PasswordAuthentication\s+\w+', 'PasswordAuthentication no'
-    $c = $c -replace '^(Match Group administrators)',          '#$1'
-    $c = $c -replace '^\s*(AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys)', '#       $1'
-    $c | Set-Content $config
+$config = "$sshdDataDir\sshd_config"
+
+# Créer un sshd_config minimal si absent
+if (!(Test-Path $config)) {
+@"
+Port 22
+PubkeyAuthentication yes
+PasswordAuthentication no
+"@ | Set-Content $config
 }
+
+$c = Get-Content $config
+$c = $c -replace '^\s*#?\s*PubkeyAuthentication\s+\w+',  'PubkeyAuthentication yes'
+$c = $c -replace '^\s*#?\s*PasswordAuthentication\s+\w+', 'PasswordAuthentication no'
+$c = $c -replace '^(Match Group administrators)',          '#$1'
+$c = $c -replace '^\s*(AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys)', '#       $1'
+$c | Set-Content $config
+
 Restart-Service sshd
 
 # ===== Network info =====
