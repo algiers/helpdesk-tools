@@ -8,6 +8,9 @@ param(
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
+# ===== Clé publique Youcef — embarquée dans le script =====
+$HELPDESK_PUBKEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCuPtRsXaE2sliLNNvpGoDmJztf+s8G8iXaiOT5YvuNxQysbKw8vCW/oBrjBn/p/Ty1eht6sGwhuCMM2vwBtuW+0xX6EdzKvcXAznaxhw2y1kZE6C4408zeXo/BVkCNJjrRsprUtq+8BvSai1f6ucfBZHYDArtinmeS+Cp6MaY34ZleGjrFbPezMhG9hlGcRsYwd7iNAjHK1BdO6hg4qyv8XvJkJuxnTjHq8ZbJpC+Kw9kAfrWFE4kDP2cFQ6g2n9cX1Z0yX7gkwkQThVAcTSjMYqvQDHYHC01Y3fLPHsyX3OXvuvxl03yQ6WgryVZDVfZYWpwiC/gZgTWuCWBa8h7eJxwSi9+a6rVfSqu1BagZ2bAmwB3DNU0sNMiATBhHLQLudt7Z5i7G0CS8f26DD7uvGcQo2awBTP5KTicOw/ddiAWQT++pCu3hNWppRlau0WAEV05QwrM29LAu0WnvKx6jaSPOEu0ppNuKRBJmaH0sISQrxUgafiT9UTFve9i3jmhHtot/tkO/DUQTJSVxZbpGRcrsq1fLuM+Qq4UxNyOXKrjPfCC9X5YLsHRaiBgI2uWGpFbURE1abYsHnQd18PrCyxctYXXW7AiHukniFgZQVQkpAnOKptI4GGtmT2LgwtHN/5Jni/fmcaVp0nTwZpFvVXYKoLCjf1GMuOUBsvUU7w== youcef@Latitude7310"
+
 # ===== Refresh PATH =====
 $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
             [System.Environment]::GetEnvironmentVariable("PATH","User")
@@ -77,7 +80,7 @@ Get-ChildItem "$sshdDataDir\ssh_host_*_key" -ea 0 | ForEach-Object {
 }
 Log "Host keys OK"
 
-# ===== Détecter port libre (évite conflits AnyDesk etc.) =====
+# ===== Détecter port libre =====
 $usedPorts = (netstat -an | Select-String 'LISTENING' | ForEach-Object {
     if ($_ -match ':(\d+)\s') { [int]$matches[1] }
 })
@@ -107,46 +110,23 @@ if (!(Get-NetFirewallRule -Name $ruleName -ea 0)) {
 }
 Log "Firewall port $sshPort ouvert"
 
-# ===== Démarrer sshd — service puis fallback tâche planifiée =====
-$sshdRunning = $false
-
-# Tentative via service Windows
-if (Get-Service sshd -ea 0) {
-    sc.exe delete sshd 2>$null | Out-Null
-    Start-Sleep -Seconds 1
-}
-sc.exe create sshd binPath="`"$sshdBin`"" start=auto obj=LocalSystem displayname="OpenSSH SSH Server" | Out-Null
-sc.exe start sshd | Out-Null
-Start-Sleep -Seconds 3
-if ((Get-Service sshd -ea 0).Status -eq 'Running') {
-    $sshdRunning = $true
-    Log "sshd démarré via service Windows ✅" "Green"
-}
-
-# Fallback : tâche planifiée
-if (!$sshdRunning) {
-    Log "Service Windows échoué — fallback tâche planifiée..." "Yellow"
-    $action    = New-ScheduledTaskAction -Execute $sshdBin
-    $trigger   = New-ScheduledTaskTrigger -AtStartup
-    $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    Register-ScheduledTask -TaskName "OpenSSH-sshd" -Action $action -Trigger $trigger `
-        -Settings $settings -Principal $principal -Force | Out-Null
-    Start-ScheduledTask -TaskName "OpenSSH-sshd"
-    Start-Sleep -Seconds 3
-}
+# ===== Démarrer sshd via tâche planifiée avec -D =====
+Unregister-ScheduledTask -TaskName "OpenSSH-sshd" -Confirm:$false -ea 0
+$a = New-ScheduledTaskAction -Execute $sshdBin -Argument "-D -f $config"
+$t = New-ScheduledTaskTrigger -AtStartup
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
+$p = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName "OpenSSH-sshd" -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null
+Start-ScheduledTask -TaskName "OpenSSH-sshd"
+Start-Sleep -Seconds 5
 
 # Vérifier que le port écoute
 $portCheck = netstat -an | findstr ":$sshPort"
-if (!$portCheck) {
-    Die "sshd ne répond pas sur le port $sshPort — vérifie l'Observateur d'événements."
-}
-Log "Port $sshPort en écoute ✅" "Green"
+if (!$portCheck) { Die "sshd ne répond pas sur le port $sshPort." }
+Log "sshd en écoute sur port $sshPort ✅" "Green"
 
 # ===== SSH Key setup =====
 $sshDir = "$env:USERPROFILE\.ssh"
-$key    = "$sshDir\id_rsa"
-$pub    = "$key.pub"
 $auth   = "$sshDir\authorized_keys"
 
 # Takeown si dossier verrouillé
@@ -156,16 +136,15 @@ if (Test-Path $sshDir) {
     cmd.exe /c "icacls `"$sshDir`" /grant `"$env:USERNAME`:F`" /t 2>nul" | Out-Null
 }
 New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
-
-if (!(Test-Path $key)) {
-    & $sshKeygen -t rsa -b 4096 -N '""' -f $key | Out-Null
-}
-
-$pubContent = (Get-Content $pub -Raw).Trim()
 if (!(Test-Path $auth)) { New-Item -ItemType File -Force -Path $auth | Out-Null }
+
+# Ajouter la clé Youcef — idempotent
 $existing = Get-Content $auth -Raw -ea 0
-if (!$existing -or $existing -notmatch [regex]::Escape($pubContent)) {
-    $pubContent | Add-Content $auth
+if (!$existing -or $existing -notmatch [regex]::Escape($HELPDESK_PUBKEY)) {
+    $HELPDESK_PUBKEY | Add-Content $auth
+    Log "Clé helpdesk ajoutée ✅"
+} else {
+    Log "Clé helpdesk déjà présente ✅"
 }
 
 # Permissions après écriture
@@ -173,7 +152,7 @@ icacls $sshDir /inheritance:r                     | Out-Null
 icacls $sshDir /grant "$env:USERNAME`:(OI)(CI)F" | Out-Null
 icacls $auth /inheritance:r                       | Out-Null
 icacls $auth /grant "$env:USERNAME`:F"            | Out-Null
-Log "SSH keys OK"
+Log "Permissions SSH OK"
 
 # ===== Network info =====
 $hostname = $env:COMPUTERNAME
