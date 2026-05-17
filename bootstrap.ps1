@@ -8,6 +8,10 @@ param(
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
+# ===== Refresh PATH (prend en compte les install récentes) =====
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
+            [System.Environment]::GetEnvironmentVariable("PATH","User")
+
 # ===== PowerShell update =====
 if (Get-Command winget -ea 0) {
     winget install Microsoft.PowerShell -e --source winget `
@@ -19,6 +23,9 @@ $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
 if ($cap.State -ne 'Installed') {
     Write-Host "  Installing OpenSSH..." -ForegroundColor Gray
     Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+    # Refresh PATH après install
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
+                [System.Environment]::GetEnvironmentVariable("PATH","User")
 }
 
 # Attendre que le service sshd apparaisse (max 60s)
@@ -30,28 +37,54 @@ if (!(Get-Service sshd -ea 0)) {
     Write-Host "❌ OpenSSH install failed." -ForegroundColor Red; exit 1
 }
 
-# ===== Générer les host keys dans le bon répertoire =====
-$opensshBin  = "$env:SystemRoot\System32\OpenSSH"
+# ===== Trouver ssh-keygen dynamiquement =====
+$sshKeygen = $null
+$kCmd = Get-Command ssh-keygen -ea 0
+if ($kCmd) { $sshKeygen = $kCmd.Source }
+if (!$sshKeygen) {
+    $candidates = @(
+        "$env:SystemRoot\System32\OpenSSH\ssh-keygen.exe",
+        "$env:ProgramFiles\OpenSSH\ssh-keygen.exe",
+        "$env:ProgramFiles\OpenSSH-Win64\ssh-keygen.exe"
+    )
+    foreach ($p in $candidates) { if (Test-Path $p) { $sshKeygen = $p; break } }
+}
+Write-Host "  ssh-keygen : $sshKeygen" -ForegroundColor Gray
+
+# ===== Générer les host keys dans C:\ProgramData\ssh\ =====
 $sshdDataDir = "C:\ProgramData\ssh"
+if (!(Test-Path $sshdDataDir)) { New-Item -ItemType Directory -Force -Path $sshdDataDir | Out-Null }
 
-if (!(Test-Path $sshdDataDir)) {
-    New-Item -ItemType Directory -Force -Path $sshdDataDir | Out-Null
+if ($sshKeygen) {
+    Push-Location $sshdDataDir
+    & $sshKeygen -A 2>$null
+    Pop-Location
 }
 
-# Générer toutes les host keys dans C:\ProgramData\ssh\
-Push-Location $sshdDataDir
-& "$opensshBin\ssh-keygen.exe" -A 2>$null
-Pop-Location
-
-# Fixer les permissions des host keys pour NT SERVICE\sshd
+# Fixer les permissions des host keys
 Get-ChildItem "$sshdDataDir\ssh_host_*_key" -ea 0 | ForEach-Object {
-    icacls $_.FullName /inheritance:r                          | Out-Null
-    icacls $_.FullName /grant "NT AUTHORITY\SYSTEM:F"          | Out-Null
-    icacls $_.FullName /grant "BUILTIN\Administrators:F"       | Out-Null
-    icacls $_.FullName /grant "NT SERVICE\sshd:R"              | Out-Null
+    icacls $_.FullName /inheritance:r                    | Out-Null
+    icacls $_.FullName /grant "NT AUTHORITY\SYSTEM:F"    | Out-Null
+    icacls $_.FullName /grant "BUILTIN\Administrators:F" | Out-Null
+    icacls $_.FullName /grant "NT SERVICE\sshd:R"        | Out-Null
 }
 
-Start-Service sshd
+# ===== Démarrer sshd avec diagnostics =====
+try {
+    Start-Service sshd -ErrorAction Stop
+} catch {
+    Write-Host "⚠️  sshd start failed, checking logs..." -ForegroundColor Yellow
+    Get-WinEvent -LogName System -MaxEvents 10 -ea 0 |
+        Where-Object { $_.ProviderName -match 'sshd|OpenSSH' } |
+        ForEach-Object { Write-Host "   LOG: $($_.Message)" -ForegroundColor Red }
+    # Tenter sc.exe comme fallback
+    sc.exe start sshd 2>$null
+    Start-Sleep -Seconds 3
+    if ((Get-Service sshd).Status -ne 'Running') {
+        Write-Host "❌ sshd cannot start. Check Windows Event Viewer > System for details." -ForegroundColor Red
+        exit 1
+    }
+}
 Set-Service sshd -StartupType Automatic
 
 # Firewall
@@ -66,20 +99,23 @@ $key    = "$sshDir\id_rsa"
 $pub    = "$key.pub"
 $auth   = "$sshDir\authorized_keys"
 
-# Reprendre ownership si permissions cassées par un run précédent
+# Reprendre ownership via cmd.exe (plus fiable que takeown PowerShell)
 if (Test-Path $sshDir) {
-    takeown /f $sshDir /r /d y 2>$null | Out-Null
-    icacls $sshDir /reset /t 2>$null   | Out-Null
+    cmd.exe /c "takeown /f `"$sshDir`" /r /d y" 2>$null
+    cmd.exe /c "icacls `"$sshDir`" /grant Administrators:F /t" 2>$null
+    cmd.exe /c "icacls `"$sshDir`" /grant `"$env:USERNAME`:F`" /t" 2>$null
 }
 
 New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
 
 # Générer la clé si absente
-if (!(Test-Path $key)) {
+if (!(Test-Path $key) -and $sshKeygen) {
+    & $sshKeygen -t rsa -b 4096 -N '""' -f $key | Out-Null
+} elseif (!(Test-Path $key)) {
     ssh-keygen -t rsa -b 4096 -N '""' -f $key | Out-Null
 }
 
-# Créer authorized_keys et y ajouter la clé — idempotent
+# Créer et écrire authorized_keys — idempotent
 $pubContent = (Get-Content $pub -Raw).Trim()
 if (!(Test-Path $auth)) { New-Item -ItemType File -Force -Path $auth | Out-Null }
 $existing = Get-Content $auth -Raw -ea 0
@@ -95,8 +131,6 @@ icacls $auth /grant "$env:USERNAME`:F"            | Out-Null
 
 # ===== sshd_config =====
 $config = "$sshdDataDir\sshd_config"
-
-# Créer un sshd_config minimal si absent
 if (!(Test-Path $config)) {
 @"
 Port 22
